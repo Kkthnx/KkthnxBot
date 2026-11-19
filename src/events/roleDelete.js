@@ -1,0 +1,48 @@
+/*
+ * KkthnxBot. Copyright (c) 2026 Kkthnx. All Rights Reserved.
+ * Proprietary and confidential. Unauthorized copying, use, distribution, or
+ * modification of this file or any part of it, via any medium, is strictly
+ * prohibited. See the LICENSE file for full terms.
+ */
+
+const GuildConfig = require('../database/GuildConfigSchema');
+const ReactionRole = require('../database/ReactionRoleSchema');
+const { invalidateGuildConfig } = require('../utils/guildConfigCache');
+const logger = require('../utils/logger');
+
+// When a role is deleted in Discord, scrub every reference to it from the guild
+// config so the self-assign menu and feature pings never point at a dead role.
+module.exports = {
+    name: 'roleDelete',
+    async execute(role) {
+        try {
+            const cfg = await GuildConfig.findOne({ guildId: role.guild.id });
+            if (!cfg) return;
+            let changed = false;
+
+            const selfBefore = cfg.selfRoles.length;
+            cfg.selfRoles = cfg.selfRoles.filter(r => r.roleId !== role.id);
+            if (cfg.selfRoles.length !== selfBefore) changed = true;
+
+            if (cfg.verifyRoleId === role.id) { cfg.verifyRoleId = null; changed = true; }
+
+            if (changed) {
+                await cfg.save();
+                invalidateGuildConfig(role.guild.id);
+                logger.info(`[ROLES] Scrubbed deleted role ${role.id} from ${role.guild.id} config.`);
+            }
+
+            // Reaction-role menus point at roles too. Leaving a dead pairing in
+            // place means members react and silently get nothing.
+            const pruned = await ReactionRole.updateMany(
+                { guildId: role.guild.id, 'pairs.roleId': role.id },
+                { $pull: { pairs: { roleId: role.id } } },
+            );
+            if (pruned.modifiedCount) {
+                logger.info(`[ROLES] Removed deleted role ${role.id} from ${pruned.modifiedCount} reaction-role menu(s).`);
+            }
+        } catch (err) {
+            logger.error('roleDelete cleanup failed:', err);
+        }
+    },
+};

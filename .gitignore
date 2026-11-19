@@ -1,0 +1,11 @@
+node_modules/
+.env
+.env.local
+.env.development
+.env.test
+.env.production
+npm-debug.log*
+.DS_Store
+
+# The host regenerates this on every boot (npm install), so it is not tracked.
+package-lock.json

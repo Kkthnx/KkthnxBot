@@ -1,0 +1,19 @@
+{
+    "moderation": {
+        "antiSpam": {
+            "enabled": true,
+            "maxMessages": 5,
+            "windowSeconds": 5,
+            "maxMentions": 5,
+            "blockInvites": true,
+            "timeoutMinutes": 5
+        }
+    },
+    "tuning": {
+        "guildConfigCacheTtlMs": 600000,
+        "giveawayCheckMs": 30000,
+        "reminderCheckMs": 30000,
+        "tempBanCheckMs": 60000,
+        "commandRegisterMinIntervalMs": 3600000
+    }
+}

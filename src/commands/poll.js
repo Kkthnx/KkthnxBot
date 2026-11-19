@@ -1,0 +1,51 @@
+/*
+ * KkthnxBot. Copyright (c) 2026 Kkthnx. All Rights Reserved.
+ * Proprietary and confidential. Unauthorized copying, use, distribution, or
+ * modification of this file or any part of it, via any medium, is strictly
+ * prohibited. See the LICENSE file for full terms.
+ */
+
+const { SlashCommandBuilder, PollLayoutType, MessageFlags, InteractionContextType } = require('discord.js');
+const { screenText, TEXT_REFUSED } = require('../utils/textGuard');
+
+module.exports = {
+    data: (() => {
+        const b = new SlashCommandBuilder()
+            .setName('poll')
+            .setDescription('Create a poll the server votes on')
+            .setContexts(InteractionContextType.Guild)
+            .addStringOption(o => o.setName('question').setDescription('The poll question').setRequired(true).setMaxLength(300))
+            .addStringOption(o => o.setName('option1').setDescription('Answer 1').setRequired(true).setMaxLength(55))
+            .addStringOption(o => o.setName('option2').setDescription('Answer 2').setRequired(true).setMaxLength(55));
+        for (let i = 3; i <= 6; i++) {
+            b.addStringOption(o => o.setName(`option${i}`).setDescription(`Answer ${i}`).setRequired(false).setMaxLength(55));
+        }
+        b.addIntegerOption(o => o.setName('hours').setDescription('How long the poll runs (1-168, default 24)').setMinValue(1).setMaxValue(168).setRequired(false));
+        b.addBooleanOption(o => o.setName('multi').setDescription('Allow selecting multiple answers').setRequired(false));
+        return b;
+    })(),
+
+    async execute(interaction) {
+        const question = interaction.options.getString('question');
+        const answers = [];
+        for (let i = 1; i <= 6; i++) {
+            const val = interaction.options.getString(`option${i}`);
+            if (val) answers.push({ text: val });
+        }
+        if (screenText(question, ...answers.map(a => a.text))) {
+            return interaction.reply({ content: TEXT_REFUSED, flags: MessageFlags.Ephemeral });
+        }
+        const hours = interaction.options.getInteger('hours') ?? 24;
+        const multi = interaction.options.getBoolean('multi') ?? false;
+
+        return interaction.reply({
+            poll: {
+                question: { text: question },
+                answers,
+                duration: hours,
+                allowMultiselect: multi,
+                layoutType: PollLayoutType.Default,
+            },
+        }).catch(() => interaction.reply({ content: 'Failed to create the poll, I may be missing permissions here.', flags: MessageFlags.Ephemeral }));
+    },
+};

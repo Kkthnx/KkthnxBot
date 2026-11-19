@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # No lockfile is tracked in this repo (the host regenerates it on every
+      # boot, see .gitignore), so install without cache instead of npm ci.
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      # Fail fast if any source file has a syntax error.
+      - name: Syntax check
+        run: |
+          for f in $(find src shard.js -name '*.js'); do
+            node --check "$f"
+          done
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Run unit tests
+        run: npm test

@@ -1,0 +1,51 @@
+/*
+ * KkthnxBot. Copyright (c) 2026 Kkthnx. All Rights Reserved.
+ * Proprietary and confidential. Unauthorized copying, use, distribution, or
+ * modification of this file or any part of it, via any medium, is strictly
+ * prohibited. See the LICENSE file for full terms.
+ */
+
+const { SlashCommandBuilder, PermissionFlagsBits, MessageFlags, InteractionContextType } = require('discord.js');
+const { blockReason, tryRecordInfraction, withTargetNotice, auditReason, RECORD_FAILED_NOTE } = require('../../utils/moderationManager');
+const { parseDuration, clampTimeout, humanizeDuration } = require('../../utils/duration');
+
+module.exports = {
+    data: new SlashCommandBuilder()
+        .setName('timeout')
+        .setDescription('Temporarily mute a member (Discord timeout)')
+        .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers)
+        .setContexts(InteractionContextType.Guild)
+        .addUserOption(o => o.setName('target').setDescription('Member to time out').setRequired(true))
+        .addStringOption(o => o.setName('duration').setDescription('e.g. 10m, 1h, 1d (max 28d)').setRequired(true))
+        .addStringOption(o => o.setName('reason').setDescription('Reason').setRequired(false).setMaxLength(500)),
+
+    async execute(interaction) {
+        const targetUser = interaction.options.getUser('target');
+        const member = interaction.options.getMember('target');
+        const reason = interaction.options.getString('reason') || 'No reason provided';
+
+        if (!member) return interaction.reply({ content: 'That user is not in this server.', flags: MessageFlags.Ephemeral });
+
+        const block = blockReason(interaction, member);
+        if (block) return interaction.reply({ content: block, flags: MessageFlags.Ephemeral });
+
+        const parsed = parseDuration(interaction.options.getString('duration'));
+        if (!parsed) return interaction.reply({ content: 'Invalid duration. Try `10m`, `1h`, or `1d`.', flags: MessageFlags.Ephemeral });
+        const durationMs = clampTimeout(parsed);
+
+        await interaction.deferReply();
+
+        try {
+            await withTargetNotice(
+                { targetUser, guildName: interaction.guild.name, type: 'timeout', reason, durationMs },
+                () => member.timeout(durationMs, auditReason(interaction.user.tag, reason)),
+            );
+        } catch (err) {
+            return interaction.editReply({ content: `Failed to time out that member: ${err.message}` });
+        }
+
+        const recorded = await tryRecordInfraction({ guild: interaction.guild, targetUser, moderator: interaction.user, type: 'timeout', reason, durationMs });
+        const lead = `🔇 Timed out <@${targetUser.id}> for **${humanizeDuration(durationMs)}**`;
+        return interaction.editReply({ content: `${lead}, ${recorded ? reason : RECORD_FAILED_NOTE}` });
+    },
+};

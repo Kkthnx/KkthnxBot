@@ -1,0 +1,101 @@
+/*
+ * KkthnxBot. Copyright (c) 2026 Kkthnx. All Rights Reserved.
+ * Proprietary and confidential. Unauthorized copying, use, distribution, or
+ * modification of this file or any part of it, via any medium, is strictly
+ * prohibited. See the LICENSE file for full terms.
+ */
+
+const { SlashCommandBuilder, PermissionFlagsBits, MessageFlags, InteractionContextType } = require('discord.js');
+const Infraction = require('../../database/InfractionSchema');
+const { humanizeDuration } = require('../../utils/duration');
+const { clamp, fitLines, LIMITS } = require('../../utils/embedText');
+const { logModAction, modEmbed, MOD_FOOTER } = require('../../utils/moderationManager');
+
+const TYPE_ICON = { warn: '⚠️', timeout: '🔇', kick: '👢', ban: '🔨', unban: '🔓' };
+
+// How much of a reason to show in the list. The full text is kept in the record.
+const REASON_PREVIEW = 180;
+
+const PAGE_SIZE = 15;
+
+module.exports = {
+    data: new SlashCommandBuilder()
+        .setName('infractions')
+        .setDescription('View or clear a member\'s moderation history')
+        .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers)
+        .setContexts(InteractionContextType.Guild)
+        .addSubcommand(sub => sub
+            .setName('view')
+            .setDescription('Show a member\'s infraction history')
+            .addUserOption(o => o.setName('target').setDescription('Member to look up').setRequired(true)))
+        .addSubcommand(sub => sub
+            .setName('clear')
+            .setDescription('Clear a member\'s infraction history (Manage Server)')
+            .addUserOption(o => o.setName('target').setDescription('Member to clear').setRequired(true))),
+
+    async execute(interaction) {
+        const sub = interaction.options.getSubcommand();
+        const targetUser = interaction.options.getUser('target');
+
+        if (sub === 'clear') {
+            if (!interaction.member.permissions.has(PermissionFlagsBits.ManageGuild)) {
+                return interaction.reply({ content: 'You need the **Manage Server** permission to clear infractions.', flags: MessageFlags.Ephemeral });
+            }
+            const { deletedCount } = await Infraction.deleteMany({ guildId: interaction.guild.id, userId: targetUser.id });
+            // Wiping a record is the one moderation action that erases evidence,
+            // so it leaves a trace in the mod-log.
+            await logModAction({
+                guild: interaction.guild,
+                moderator: interaction.user,
+                title: 'Infractions cleared',
+                fields: [
+                    { name: 'User', value: `<@${targetUser.id}> \`${targetUser.tag}\``, inline: true },
+                    { name: 'Records removed', value: `${deletedCount}`, inline: true },
+                ],
+            });
+            return interaction.reply({ content: `🧹 Cleared **${deletedCount}** infraction(s) for <@${targetUser.id}>.`, flags: MessageFlags.Ephemeral });
+        }
+
+        // view
+        const filter = { guildId: interaction.guild.id, userId: targetUser.id };
+        const [records, totals] = await Promise.all([
+            Infraction.find(filter).sort({ createdAt: -1 }).limit(PAGE_SIZE).lean(),
+            // Counted across the whole history, not just the page below. Summing
+            // the page called 3 warns a summary when the member had 50.
+            Infraction.aggregate([{ $match: filter }, { $group: { _id: '$type', n: { $sum: 1 } } }]),
+        ]);
+
+        const embed = modEmbed()
+            .setAuthor({ name: `Infractions, ${targetUser.tag}`, iconURL: targetUser.displayAvatarURL() });
+
+        if (!records.length) {
+            embed.setDescription('✅ This member has a clean record.');
+            return interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
+        }
+
+        const total = totals.reduce((sum, t) => sum + t.n, 0);
+        const summary = totals
+            .sort((a, b) => b.n - a.n)
+            .map(t => `${TYPE_ICON[t._id] || ''} ${t.n} ${t._id}`)
+            .join(', ');
+
+        // Reasons are free text from a moderator, so a handful of paragraphs is
+        // enough to push this past Discord's 4096 and make the whole command
+        // throw. Each reason is clamped for the list, and the list itself is
+        // fitted to what's left; the full text stays in the database.
+        const lines = records.map(r => {
+            const when = `<t:${Math.floor(new Date(r.createdAt).getTime() / 1000)}:R>`;
+            const dur = r.durationMs ? ` (${humanizeDuration(r.durationMs)})` : '';
+            return `${TYPE_ICON[r.type] || ''} **${r.type}**${dur}, ${clamp(r.reason, REASON_PREVIEW)}\n└ by <@${r.moderatorId}> ${when}`;
+        });
+
+        const heading = `**Summary:** ${clamp(summary, 500)}\n\n`;
+        embed.setDescription(heading + fitLines(lines, LIMITS.description - heading.length - 2));
+
+        if (total > records.length) {
+            embed.setFooter({ text: `${MOD_FOOTER}, showing the latest ${records.length} of ${total}` });
+        }
+
+        return interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
+    },
+};

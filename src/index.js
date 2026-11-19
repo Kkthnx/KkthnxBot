@@ -1,0 +1,208 @@
+/*
+ * KkthnxBot. Copyright (c) 2026 Kkthnx. All Rights Reserved.
+ * Proprietary and confidential. Unauthorized copying, use, distribution, or
+ * modification of this file or any part of it, via any medium, is strictly
+ * prohibited. See the LICENSE file for full terms.
+ */
+
+require('dotenv').config({ quiet: true });
+const { Client, GatewayIntentBits, Collection, Options, Partials } = require('discord.js');
+const mongoose = require('mongoose');
+const fs = require('fs');
+const path = require('path');
+const logger = require('./utils/logger');
+
+// ---------------------------------------------------------------------------
+// Global error handlers, prevents the bot from dying on unhandled rejections
+// ---------------------------------------------------------------------------
+process.on('unhandledRejection', (reason) => {
+    logger.error(`Unhandled Promise Rejection: ${reason?.stack || reason}`);
+});
+process.on('uncaughtException', (err) => {
+    logger.error('Uncaught Exception:', err);
+    process.exit(1);
+});
+
+// 1. Initialize the Client with required Intents
+const client = new Client({
+    intents: [
+        GatewayIntentBits.Guilds,
+        GatewayIntentBits.GuildMessages,
+        GatewayIntentBits.MessageContent,
+        GatewayIntentBits.GuildMembers,
+        GatewayIntentBits.GuildMessageReactions,
+        // Needed for guildAuditLogEntryCreate. Not a privileged intent.
+        GatewayIntentBits.GuildModeration,
+    ],
+    // Partials let reaction events fire for messages that aren't cached
+    // (e.g. older messages), which the starboard relies on.
+    partials: [Partials.Message, Partials.Channel, Partials.Reaction],
+    // Bound the largest caches so long uptimes can't grow unbounded (OOM guard).
+    makeCache: Options.cacheWithLimits({
+        ...Options.DefaultMakeCacheSettings,
+        MessageManager: 100,                // keep at most 100 messages per channel
+        ReactionManager: 0,
+        GuildInviteManager: 0,
+    }),
+    // Periodically reclaim memory from inactive cached objects.
+    sweepers: {
+        ...Options.DefaultSweeperSettings,
+        messages: {
+            interval: 600,                  // every 10 minutes
+            lifetime: 3600,                 // drop messages older than 1 hour (so more deletes log with content)
+        },
+        users: {
+            interval: 3600,                 // every hour
+            filter: () => (user) => user.id !== client.user?.id,
+        },
+    },
+});
+
+// Client & Shard Error Handlers (prevents websocket disconnects from crashing)
+client.on('error', err => logger.error('[CLIENT_ERROR]', err));
+client.on('shardError', (err, shardId) => logger.error(`[SHARD_ERROR] Shard ${shardId} encountered an error:`, err));
+client.on('warn', info => logger.warn(`[CLIENT_WARN] ${info}`));
+
+// Loaded slash commands, keyed by name
+client.commands = new Collection();
+
+// Periodically clean up in-memory maps to prevent leaks over long uptimes
+const { sweepIdle } = require('./utils/antiSpam');
+const { sweepIdle: sweepCommandCooldowns } = require('./utils/commandCooldowns');
+const { sweepIdle: sweepJoinFlood } = require('./utils/joinFlood');
+const { pruneGuildConfigCache } = require('./utils/guildConfigCache');
+setInterval(() => {
+    const now = Date.now();
+    // Evict idle anti-spam rate buckets.
+    sweepIdle(now);
+    // Evict idle per-command cooldown entries.
+    sweepCommandCooldowns(now);
+    // Evict join-rate windows for quiet guilds.
+    sweepJoinFlood(now);
+    // Forget settings for guilds we are no longer in.
+    pruneGuildConfigCache(client.guilds.cache.keys());
+}, 60 * 60 * 1000);
+
+// 2. Connect to the Database with Automatic Reconnect & Exponential Backoff
+let mongoRetryCount = 0;
+const BASE_RETRY_DELAY = 1000; // 1 second
+const MAX_RETRY_DELAY = 60 * 1000;
+
+function connectMongo() {
+    mongoose.connect(process.env.MONGO_URI, {
+        serverSelectionTimeoutMS: 10000,
+        socketTimeoutMS: 45000,
+        heartbeatFrequencyMS: 10000, // probe the primary every 10s so drops surface fast
+        minPoolSize: 2, // keep a couple of connections warm so idle reaping doesn't churn
+        maxPoolSize: 10,
+        family: 4, // force IPv4; the Atlas SRV lookup over IPv6 times out on some hosts
+        retryWrites: true,
+    })
+        .then(() => {
+            logger.info('Connected to MongoDB Atlas');
+            mongoRetryCount = 0; // Reset on successful connection
+        })
+        .catch((err) => {
+            logger.error('MongoDB Connection Error:', err.message);
+
+            // Never give up. Once the first connect succeeds the driver reconnects
+            // by itself, but a failed first connect leaves nothing retrying, so a
+            // database that was down at boot used to leave the bot without storage
+            // until someone restarted it.
+            mongoRetryCount += 1;
+            const delayMs = Math.min(BASE_RETRY_DELAY * Math.pow(2, Math.min(mongoRetryCount - 1, 10)), MAX_RETRY_DELAY);
+            logger.warn(`Retrying MongoDB connection in ${delayMs}ms (attempt ${mongoRetryCount})...`);
+            setTimeout(connectMongo, delayMs);
+        });
+}
+
+connectMongo();
+
+// After the initial connect, the driver's own connection pool handles transient
+// drops and reconnects on its own. We only log the state changes. Manually
+// calling connect() again here would stack overlapping attempts and spam the log.
+mongoose.connection.on('disconnected', () => {
+    logger.warn('MongoDB connection lost. The driver is reconnecting...');
+});
+
+mongoose.connection.on('reconnected', () => {
+    logger.info('Reconnected to MongoDB Atlas');
+});
+
+mongoose.connection.on('error', (err) => {
+    logger.error('MongoDB connection error:', err.message);
+});
+
+// 3. Event Handler (loads .js files from src/events)
+const eventsPath = path.join(__dirname, 'events');
+if (fs.existsSync(eventsPath)) {
+    const eventFiles = fs.readdirSync(eventsPath).filter(file => file.endsWith('.js'));
+    for (const file of eventFiles) {
+        const filePath = path.join(eventsPath, file);
+        const event = require(filePath);
+
+        // Wrap every handler. Binding event.execute directly meant any rejection
+        // inside it became an unhandled rejection: reported without saying which
+        // event produced it, and one per occurrence. messageCreate awaits the
+        // guild config outside a try/catch, so a database blip used to mean one
+        // anonymous unhandled rejection for every message in the server.
+        const handler = async (...args) => {
+            try {
+                await event.execute(...args, client);
+            } catch (err) {
+                logger.error(`[EVENT_ERROR] ${event.name}:`, err);
+            }
+        };
+
+        if (event.once) {
+            client.once(event.name, handler);
+        } else {
+            client.on(event.name, handler);
+        }
+    }
+}
+
+// 4. Command Loader, recursively load all command files
+const commandsPath = path.join(__dirname, 'commands');
+
+function loadCommandFiles(dir) {
+    const entries = fs.readdirSync(dir, { withFileTypes: true });
+    for (const entry of entries) {
+        const fullPath = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+            loadCommandFiles(fullPath);
+            continue;
+        }
+
+        if (!entry.isFile() || !entry.name.endsWith('.js')) continue;
+        const command = require(fullPath);
+        if ('data' in command && 'execute' in command) {
+            client.commands.set(command.data.name, command);
+        } else {
+            logger.warn(`[WARN] ${fullPath} is missing "data" or "execute".`);
+        }
+    }
+}
+
+loadCommandFiles(commandsPath);
+
+// 5. Log in to Discord
+client.login(process.env.TOKEN)
+    .then(() => logger.info('KkthnxBot is online and running!'))
+    .catch((err) => logger.error('Failed to login:', err));
+
+// 6. Graceful shutdown. Close the gateway first so no new event arrives
+// mid-teardown, then close the database.
+let shuttingDown = false;
+async function gracefulShutdown(signal) {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    logger.info(`Received ${signal}, shutting down`);
+    try { client.destroy(); } catch (err) { logger.error('Error destroying client:', err); }
+    try { await mongoose.connection.close(); } catch (err) { logger.error('Error closing MongoDB:', err); }
+    process.exit(0);
+}
+
+for (const signal of ['SIGINT', 'SIGTERM']) {
+    process.on(signal, () => gracefulShutdown(signal));
+}
